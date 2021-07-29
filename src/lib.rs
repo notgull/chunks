@@ -11,14 +11,13 @@
 
 use core::{
     iter::{FusedIterator, TrustedLen},
-    marker::PhantomData,
-    mem::{self, MaybeUninit},
+    mem::MaybeUninit,
     ops::{ControlFlow, Try},
     ptr,
 };
 
 /// Iterator extension trait that adds the `chunks()` method.
-pub trait IteratorExt: Sized {
+pub trait IteratorExt: Iterator + Sized {
     /// Group elements of this iterator into constant-size arrays, or "chunks", and creates an iterator over
     /// those.
     ///
@@ -59,9 +58,13 @@ pub trait IteratorExt: Sized {
 
 impl<I: Iterator> IteratorExt for I {
     fn chunks<const N: usize>(self) -> Chunks<Self, N> {
+        // We do this assert! because it's what chunks_exact() for the "slice" method does. This can change in
+        // the future.
+        assert_ne!(N, 0);
+
         Chunks {
             iter: self,
-            _marker: PhantomData,
+            buffer: ChunkBuffer::new(),
         }
     }
 }
@@ -71,9 +74,54 @@ impl<I: Iterator> IteratorExt for I {
 /// This iterator is returned by the [`chunks`] method on [`IteratorExt`]. See its documentation for more
 /// information.
 #[derive(Debug, Clone)]
-pub struct Chunks<I, const N: usize> {
+pub struct Chunks<I: Iterator, const N: usize> {
+    /// The inner iterator.
     iter: I,
-    _marker: PhantomData<[(); N]>,
+    /// Internal buffer containing an array and the part that is initialized. Cached here to ensure that it can
+    /// always get the remainder.
+    buffer: ChunkBuffer<I::Item, N>,
+}
+
+impl<I: Iterator, const N: usize> Chunks<I, N> {
+    /// Gets the remaining elements that could not fit into the final chunk. This slice will only be non-empty
+    /// after iteration has completed, and the number of elements in the iterator modulo the number of elements
+    /// in a chunk is not zero.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use chunks::IteratorExt;
+    ///
+    /// let data = vec![1, 2, 3, 4, 5];
+    /// let mut chunks = data.into_iter().chunks::<2>();
+    /// assert_eq!(chunks.next(), Some([1, 2]));
+    /// assert_eq!(chunks.next(), Some([3, 4]));
+    /// assert_eq!(chunks.next(), None);
+    /// assert_eq!(chunks.remainder(), &[5]);
+    /// ```
+    pub fn remainder(&self) -> &[I::Item] {
+        self.buffer.initialized_slice()
+    }
+
+    /// Gets a mutable reference to the remaining elements that could not fit into the final chunk. This slice
+    /// will only be non-empty after iteration has completed, and the number of elements in the iterator modulo
+    /// the number of elements in a chunk is not zero.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use chunks::IteratorExt;
+    /// 
+    /// let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
+    /// let mut chunks = data.into_iter().chunks::<3>();
+    /// assert_eq!(chunks.next(), Some([1, 2, 3]));
+    /// assert_eq!(chunks.next(), Some([4, 5, 6]));
+    /// assert_eq!(chunks.next(), None);
+    /// assert_eq!(chunks.remainder_mut(), &mut [7, 8]);
+    /// ```
+    pub fn remainder_mut(&mut self) -> &mut [I::Item] {
+        self.buffer.initialized_slice_mut()
+    }
 }
 
 impl<I: Iterator, const N: usize> Iterator for Chunks<I, N> {
@@ -81,7 +129,7 @@ impl<I: Iterator, const N: usize> Iterator for Chunks<I, N> {
 
     fn next(&mut self) -> Option<[I::Item; N]> {
         self.iter
-            .try_fold(ChunkBuffer::new(), fill_chunk_buffer::<I::Item, N>)
+            .try_fold(&mut self.buffer, fill_chunk_buffer::<I::Item, N>)
             .break_value()
     }
 
@@ -101,17 +149,19 @@ impl<I: Iterator, const N: usize> Iterator for Chunks<I, N> {
     where
         F: FnMut(B, [I::Item; N]) -> R,
     {
-        match self
-            .iter
-            .try_fold(FoldHelper::new(init), chunks_try_fold(f))
-        {
+        match self.iter.try_fold(
+            TryFoldHelper::new(init, &mut self.buffer),
+            chunks_try_fold(f),
+        ) {
             ControlFlow::Continue(val) => R::from_output(val.accum),
             ControlFlow::Break(br) => R::from_residual(br),
         }
     }
 
     fn fold<B, F: FnMut(B, [I::Item; N]) -> B>(self, init: B, f: F) -> B {
-        self.iter.fold(FoldHelper::new(init), chunks_fold(f)).accum
+        let Chunks { iter, buffer } = self;
+        iter.fold(FoldHelper::new(init, buffer), chunks_fold(f))
+            .accum
     }
 }
 
@@ -124,7 +174,7 @@ impl<I: DoubleEndedIterator, const N: usize> DoubleEndedIterator for Chunks<I, N
     // These methods are nearly identical to the ones above; consult those for more information.
     fn next_back(&mut self) -> Option<[I::Item; N]> {
         self.iter
-            .try_rfold(ChunkBuffer::new(), fill_chunk_buffer::<I::Item, N>)
+            .try_rfold(&mut self.buffer, fill_chunk_buffer::<I::Item, N>)
             .break_value()
     }
 
@@ -136,29 +186,31 @@ impl<I: DoubleEndedIterator, const N: usize> DoubleEndedIterator for Chunks<I, N
     where
         F: FnMut(B, [I::Item; N]) -> R,
     {
-        match self
-            .iter
-            .try_fold(FoldHelper::new(init), chunks_try_fold(f))
-        {
+        match self.iter.try_fold(
+            TryFoldHelper::new(init, &mut self.buffer),
+            chunks_try_fold(f),
+        ) {
             ControlFlow::Continue(val) => R::from_output(val.accum),
             ControlFlow::Break(br) => R::from_residual(br),
         }
     }
 
     fn rfold<B, F: FnMut(B, [I::Item; N]) -> B>(self, init: B, f: F) -> B {
-        self.iter.rfold(FoldHelper::new(init), chunks_fold(f)).accum
+        let Chunks { iter, buffer } = self;
+        iter.rfold(FoldHelper::new(init, buffer), chunks_fold(f))
+            .accum
     }
 }
 
 // SAFETY: our size is exact, see above
 unsafe impl<I: TrustedLen, const N: usize> TrustedLen for Chunks<I, N> {}
 
-/// Helper method for next; fills up the chunk buffer and breaks when it is full.
+/// Helper method for next(); fills up the chunk buffer and breaks when it is full.
 #[inline]
 fn fill_chunk_buffer<Item, const N: usize>(
-    mut chunk_buffer: ChunkBuffer<Item, N>,
+    chunk_buffer: &mut ChunkBuffer<Item, N>,
     item: Item,
-) -> ControlFlow<[Item; N], ChunkBuffer<Item, N>> {
+) -> ControlFlow<[Item; N], &mut ChunkBuffer<Item, N>> {
     // SAFETY: if we're still running, we haven't exhausted the buffer yet
     if unsafe { chunk_buffer.push(item) } {
         // SAFETY: the chunk buffer is full, time to return
@@ -169,16 +221,17 @@ fn fill_chunk_buffer<Item, const N: usize>(
 }
 
 /// Helper function for try-folding over the iterator.
-fn chunks_try_fold<Acc, Item, R: Try<Output = Acc>, const N: usize>(
+fn chunks_try_fold<'a, Acc, Item, R: Try<Output = Acc>, const N: usize>(
     mut f: impl FnMut(Acc, [Item; N]) -> R,
-) -> impl FnMut(FoldHelper<Item, Acc, N>, Item) -> ControlFlow<R::Residual, FoldHelper<Item, Acc, N>>
-{
+) -> impl FnMut(
+    TryFoldHelper<'a, Item, Acc, N>,
+    Item,
+) -> ControlFlow<R::Residual, TryFoldHelper<'a, Item, Acc, N>> {
     // SAFETY: same as above
-    move |mut folder: FoldHelper<Item, Acc, N>, item| {
+    move |mut folder: TryFoldHelper<'a, Item, Acc, N>, item| {
         if unsafe { folder.buffer.push(item) } {
             // take the buffer out and initialize it, then update the accum
-            let buffer = mem::take(&mut folder.buffer);
-            let buffer = unsafe { buffer.assume_init() };
+            let buffer = unsafe { folder.buffer.assume_init() };
             folder.accum = match f(folder.accum, buffer).branch() {
                 ControlFlow::Continue(c) => c,
                 ControlFlow::Break(b) => return ControlFlow::Break(b),
@@ -196,12 +249,25 @@ fn chunks_fold<Acc, Item, const N: usize>(
     // SAFETY: same as above
     move |mut folder, item| {
         if unsafe { folder.buffer.push(item) } {
-            let buffer = mem::take(&mut folder.buffer);
-            let buffer = unsafe { buffer.assume_init() };
+            let buffer = unsafe { folder.buffer.assume_init() };
             folder.accum = f(folder.accum, buffer);
         }
 
         folder
+    }
+}
+
+/// Helper for try-folding over this iterator.
+struct TryFoldHelper<'a, Item, B, const N: usize> {
+    /// Reference to the buffer holding the contents we need to fold over.
+    buffer: &'a mut ChunkBuffer<Item, N>,
+    /// The current accumulator.
+    accum: B,
+}
+
+impl<'a, Item, B, const N: usize> TryFoldHelper<'a, Item, B, N> {
+    fn new(accum: B, buffer: &'a mut ChunkBuffer<Item, N>) -> TryFoldHelper<'a, Item, B, N> {
+        TryFoldHelper { buffer, accum }
     }
 }
 
@@ -214,11 +280,8 @@ struct FoldHelper<Item, B, const N: usize> {
 }
 
 impl<Item, B, const N: usize> FoldHelper<Item, B, N> {
-    fn new(accum: B) -> FoldHelper<Item, B, N> {
-        FoldHelper {
-            buffer: ChunkBuffer::new(),
-            accum,
-        }
+    fn new(accum: B, buffer: ChunkBuffer<Item, N>) -> FoldHelper<Item, B, N> {
+        FoldHelper { buffer, accum }
     }
 }
 
@@ -226,6 +289,7 @@ impl<Item, B, const N: usize> FoldHelper<Item, B, N> {
 /// within are dropped as well.
 ///
 /// This is similar to an `ArrayVec<[T; N]>`. There may or may not be a better alternative to this.
+#[derive(Debug)]
 struct ChunkBuffer<Item, const N: usize> {
     /// Internal buffer for storing elements.
     buffer: [MaybeUninit<Item>; N],
@@ -234,9 +298,21 @@ struct ChunkBuffer<Item, const N: usize> {
     initialized: usize,
 }
 
-impl<Item, const N: usize> Default for ChunkBuffer<Item, N> {
-    fn default() -> ChunkBuffer<Item, N> {
-        ChunkBuffer::new()
+impl<Item: Clone, const N: usize> Clone for ChunkBuffer<Item, N> {
+    fn clone(&self) -> ChunkBuffer<Item, N> {
+        let mut copied_buffer = ChunkBuffer::new();
+
+        // begin copying elements over to the copied buffer
+        for i in 0..self.initialized {
+            // SAFETY: we know self.buffer[i] is initialized
+            copied_buffer.buffer[i] =
+                MaybeUninit::new(unsafe { MaybeUninit::assume_init_ref(&self.buffer[i]).clone() });
+
+            // bump the initialized count by 1
+            copied_buffer.initialized += 1;
+        }
+
+        copied_buffer
     }
 }
 
@@ -274,12 +350,24 @@ impl<Item, const N: usize> ChunkBuffer<Item, N> {
     /// # Safety
     ///
     /// If `push` did not previously return `true`, the behavior of this function is undefined.
-    unsafe fn assume_init(self) -> [Item; N] {
+    unsafe fn assume_init(&mut self) -> [Item; N] {
         // SAFETY: if `push` returned true, `buffer` is fully initialized
-        //         mem::forget() is called after so buffer is never accessed again
+        //         we set "initialized" to zero, so the buffer essentially returns to being uninitialized
         let res = MaybeUninit::array_assume_init(ptr::read(&self.buffer));
-        mem::forget(self);
+        self.initialized = 0;
         res
+    }
+
+    /// Gets the slice containing the initialized memory in this buffer.
+    fn initialized_slice(&self) -> &[Item] {
+        // SAFETY: we know that 0..initialized is initialized
+        unsafe { MaybeUninit::slice_assume_init_ref(&self.buffer[..self.initialized]) }
+    }
+
+    /// Gets the mutable slice containing the initialized memory in this buffer.
+    fn initialized_slice_mut(&mut self) -> &mut [Item] {
+        // SAFETY: same as above
+        unsafe { MaybeUninit::slice_assume_init_mut(&mut self.buffer[..self.initialized]) }
     }
 }
 
