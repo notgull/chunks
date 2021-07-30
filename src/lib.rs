@@ -66,6 +66,7 @@ impl<I: Iterator> IteratorExt for I {
         Chunks {
             iter: self,
             buffer: ChunkBuffer::new(),
+            remainder_cut: false,
         }
     }
 }
@@ -81,6 +82,9 @@ pub struct Chunks<I: Iterator, const N: usize> {
     /// Internal buffer containing an array and the part that is initialized. Cached here to ensure that it can
     /// always get the remainder.
     buffer: ChunkBuffer<I::Item, N>,
+    /// This is set to "true" if we've already cut the remainder off of the end of "iter". If we don't use
+    /// the DoubleEndedIterator methods, this is never used.
+    remainder_cut: bool,
 }
 
 impl<I: Iterator, const N: usize> Chunks<I, N> {
@@ -136,10 +140,10 @@ impl<I: Iterator, const N: usize> Chunks<I, N> {
     ///
     /// let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
     /// let mut chunks = data.into_iter().chunks::<3>();
-    /// 
+    ///
     /// // discard every element in the iterator
     /// while let Some(_) = chunks.next() {}
-    /// 
+    ///
     /// let mut remainder = chunks.into_remainder();
     ///
     /// assert_eq!(remainder.next(), Some(7));
@@ -166,6 +170,16 @@ impl<I: Iterator, const N: usize> Chunks<I, N> {
         IntoRemainder {
             remainder: buffer,
             initialized: 0..initialized,
+        }
+    }
+}
+
+impl<I: DoubleEndedIterator + ExactSizeIterator, const N: usize> Chunks<I, N> {
+    /// Helper method that checks if the remainder has been cut off yet, and cuts it off it it hasn't been.
+    fn cut_remainder(&mut self) {
+        if !self.remainder_cut {
+            let _ = self.iter.advance_back_by(self.iter.len() % N);
+            self.remainder_cut = true;
         }
     }
 }
@@ -205,7 +219,7 @@ impl<I: Iterator, const N: usize> Iterator for Chunks<I, N> {
     }
 
     fn fold<B, F: FnMut(B, [I::Item; N]) -> B>(self, init: B, f: F) -> B {
-        let Chunks { iter, buffer } = self;
+        let Chunks { iter, buffer, .. } = self;
         iter.fold(FoldHelper::new(init, buffer), chunks_fold(f))
             .accum
     }
@@ -216,15 +230,21 @@ impl<I: FusedIterator, const N: usize> FusedIterator for Chunks<I, N> {}
 // size_hint() should be accurate when the inner iterator's is
 impl<I: ExactSizeIterator, const N: usize> ExactSizeIterator for Chunks<I, N> {}
 
-impl<I: DoubleEndedIterator, const N: usize> DoubleEndedIterator for Chunks<I, N> {
+impl<I: DoubleEndedIterator + ExactSizeIterator, const N: usize> DoubleEndedIterator
+    for Chunks<I, N>
+{
     // These methods are nearly identical to the ones above; consult those for more information.
     fn next_back(&mut self) -> Option<[I::Item; N]> {
+        self.cut_remainder();
+
         self.iter
             .try_rfold(&mut self.buffer, fill_chunk_buffer::<I::Item, N>)
             .break_value()
     }
 
     fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
+        self.cut_remainder();
+
         self.iter.advance_back_by(n * N).map_err(|left| left / N)
     }
 
@@ -232,6 +252,8 @@ impl<I: DoubleEndedIterator, const N: usize> DoubleEndedIterator for Chunks<I, N
     where
         F: FnMut(B, [I::Item; N]) -> R,
     {
+        self.cut_remainder();
+
         match self.iter.try_fold(
             TryFoldHelper::new(init, &mut self.buffer),
             chunks_try_fold(f),
@@ -241,8 +263,10 @@ impl<I: DoubleEndedIterator, const N: usize> DoubleEndedIterator for Chunks<I, N
         }
     }
 
-    fn rfold<B, F: FnMut(B, [I::Item; N]) -> B>(self, init: B, f: F) -> B {
-        let Chunks { iter, buffer } = self;
+    fn rfold<B, F: FnMut(B, [I::Item; N]) -> B>(mut self, init: B, f: F) -> B {
+        self.cut_remainder();
+
+        let Chunks { iter, buffer, .. } = self;
         iter.rfold(FoldHelper::new(init, buffer), chunks_fold(f))
             .accum
     }
@@ -544,5 +568,29 @@ mod tests {
         let elems = &[1, 2, 3, 4, 5, 6, 7];
         assert_eq!(elems.iter().copied().chunks::<2>().nth(2), Some([5, 6]));
         assert_eq!(elems.iter().copied().chunks::<2>().nth(3), None);
+    }
+
+    #[test]
+    fn iter_from_back() {
+        let elems = &[1, 2, 3, 4, 5, 6, 7, 8];
+        let mut chunks = elems.iter().copied().chunks::<3>();
+        assert_eq!(chunks.next_back(), Some([4, 5, 6]));
+        assert_eq!(chunks.next_back(), Some([1, 2, 3]))
+    }
+
+    #[test]
+    fn fold_from_back() {
+        let elems = &[1, 2, 3, 4, 5, 6, 7, 8];
+        let folded = elems
+            .iter()
+            .copied()
+            .chunks::<3>()
+            .rfold([0, 0, 0], |mut a, i| {
+                a[0] += i[0];
+                a[1] += i[1];
+                a[2] += i[2];
+                a
+            });
+        assert_eq!(folded, [5, 7, 9]);
     }
 }
