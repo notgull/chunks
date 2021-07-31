@@ -65,8 +65,8 @@ impl<I: Iterator> IteratorExt for I {
 
         Chunks {
             iter: self,
-            buffer: ChunkBuffer::new(),
-            remainder_cut: false,
+            front_buffer: PartialArray::new(),
+            back_remainder: None,
         }
     }
 }
@@ -75,16 +75,29 @@ impl<I: Iterator> IteratorExt for I {
 ///
 /// This iterator is returned by the [`chunks`] method on [`IteratorExt`]. See its documentation for more
 /// information.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Chunks<I: Iterator, const N: usize> {
     /// The inner iterator.
     iter: I,
-    /// Internal buffer containing an array and the part that is initialized. Cached here to ensure that it can
-    /// always get the remainder.
-    buffer: ChunkBuffer<I::Item, N>,
-    /// This is set to "true" if we've already cut the remainder off of the end of "iter". If we don't use
-    /// the DoubleEndedIterator methods, this is never used.
-    remainder_cut: bool,
+    /// Internal buffer containing an array and the part that is initialized. The remainder is left in this
+    /// buffer if front-iteration ends early.
+    front_buffer: PartialArray<I::Item, N>,
+    /// Internal buffer that holds the remainder when DoubleEndedIterator methods are used. If DEI methods aren't
+    /// used (i.e. this is `None`), this is unimportant.
+    back_remainder: Option<PartialArray<I::Item, N>>,
+}
+
+impl<I: Iterator + Clone, const N: usize> Clone for Chunks<I, N>
+where
+    I::Item: Clone,
+{
+    fn clone(&self) -> Chunks<I, N> {
+        Chunks {
+            iter: self.iter.clone(),
+            front_buffer: self.front_buffer.clone(),
+            back_remainder: self.back_remainder.as_ref().cloned(),
+        }
+    }
 }
 
 impl<I: Iterator, const N: usize> Chunks<I, N> {
@@ -105,7 +118,10 @@ impl<I: Iterator, const N: usize> Chunks<I, N> {
     /// assert_eq!(chunks.remainder(), &[5]);
     /// ```
     pub fn remainder(&self) -> &[I::Item] {
-        self.buffer.initialized_slice()
+        self.back_remainder
+            .as_ref()
+            .unwrap_or(&self.front_buffer)
+            .initialized_slice()
     }
 
     /// Gets a mutable reference to the remaining elements that could not fit into the final chunk. This slice
@@ -125,7 +141,10 @@ impl<I: Iterator, const N: usize> Chunks<I, N> {
     /// assert_eq!(chunks.remainder_mut(), &mut [7, 8]);
     /// ```
     pub fn remainder_mut(&mut self) -> &mut [I::Item] {
-        self.buffer.initialized_slice_mut()
+        self.back_remainder
+            .as_mut()
+            .unwrap_or(&mut self.front_buffer)
+            .initialized_slice_mut()
     }
 
     /// Gets an iterator over the remaining items left over by the chunking process. This iterator will be empty
@@ -166,10 +185,13 @@ impl<I: Iterator, const N: usize> Chunks<I, N> {
     /// assert_eq!(remainder.next_back(), None);
     /// ```  
     pub fn into_remainder(self) -> IntoRemainder<I::Item, N> {
-        let (buffer, initialized) = self.buffer.into_raw_parts();
+        let Chunks {
+            back_remainder,
+            front_buffer,
+            ..
+        } = self;
         IntoRemainder {
-            remainder: buffer,
-            initialized: 0..initialized,
+            remainder: back_remainder.unwrap_or(front_buffer),
         }
     }
 }
@@ -177,9 +199,15 @@ impl<I: Iterator, const N: usize> Chunks<I, N> {
 impl<I: DoubleEndedIterator + ExactSizeIterator, const N: usize> Chunks<I, N> {
     /// Helper method that checks if the remainder has been cut off yet, and cuts it off it it hasn't been.
     fn cut_remainder(&mut self) {
-        if !self.remainder_cut {
-            let _ = self.iter.advance_back_by(self.iter.len() % N);
-            self.remainder_cut = true;
+        if self.back_remainder.is_none() {
+            let mut back_remainder = PartialArray::new_back();
+            for _ in 0..self.iter.len() % N {
+                match self.iter.next_back() {
+                    Some(item) => unsafe { back_remainder.push_back(item); },
+                    None => panic!("Malicious implementation of ExactSizeIterator"),
+                }
+            }
+            self.back_remainder = Some(back_remainder);
         }
     }
 }
@@ -189,7 +217,10 @@ impl<I: Iterator, const N: usize> Iterator for Chunks<I, N> {
 
     fn next(&mut self) -> Option<[I::Item; N]> {
         self.iter
-            .try_fold(&mut self.buffer, fill_chunk_buffer::<I::Item, N>)
+            .try_fold(
+                &mut self.front_buffer,
+                fill_chunk_buffer(PartialArray::push),
+            )
             .break_value()
     }
 
@@ -210,8 +241,8 @@ impl<I: Iterator, const N: usize> Iterator for Chunks<I, N> {
         F: FnMut(B, [I::Item; N]) -> R,
     {
         match self.iter.try_fold(
-            TryFoldHelper::new(init, &mut self.buffer),
-            chunks_try_fold(f),
+            TryFoldHelper::new(init, &mut self.front_buffer),
+            chunks_try_fold(f, PartialArray::push),
         ) {
             ControlFlow::Continue(val) => R::from_output(val.accum),
             ControlFlow::Break(br) => R::from_residual(br),
@@ -219,9 +250,14 @@ impl<I: Iterator, const N: usize> Iterator for Chunks<I, N> {
     }
 
     fn fold<B, F: FnMut(B, [I::Item; N]) -> B>(self, init: B, f: F) -> B {
-        let Chunks { iter, buffer, .. } = self;
-        iter.fold(FoldHelper::new(init, buffer), chunks_fold(f))
-            .accum
+        let Chunks {
+            iter, front_buffer, ..
+        } = self;
+        iter.fold(
+            FoldHelper::new(init, front_buffer),
+            chunks_fold(f, PartialArray::push),
+        )
+        .accum
     }
 }
 
@@ -236,9 +272,10 @@ impl<I: DoubleEndedIterator + ExactSizeIterator, const N: usize> DoubleEndedIter
     // These methods are nearly identical to the ones above; consult those for more information.
     fn next_back(&mut self) -> Option<[I::Item; N]> {
         self.cut_remainder();
+        let mut buffer = PartialArray::new_back();
 
         self.iter
-            .try_rfold(&mut self.buffer, fill_chunk_buffer::<I::Item, N>)
+            .try_rfold(&mut buffer, fill_chunk_buffer(PartialArray::push_back))
             .break_value()
     }
 
@@ -253,10 +290,11 @@ impl<I: DoubleEndedIterator + ExactSizeIterator, const N: usize> DoubleEndedIter
         F: FnMut(B, [I::Item; N]) -> R,
     {
         self.cut_remainder();
+        let mut buffer = PartialArray::new_back();
 
-        match self.iter.try_fold(
-            TryFoldHelper::new(init, &mut self.buffer),
-            chunks_try_fold(f),
+        match self.iter.try_rfold(
+            TryFoldHelper::new(init, &mut buffer),
+            chunks_try_fold(f, PartialArray::push_back),
         ) {
             ControlFlow::Continue(val) => R::from_output(val.accum),
             ControlFlow::Break(br) => R::from_residual(br),
@@ -266,114 +304,89 @@ impl<I: DoubleEndedIterator + ExactSizeIterator, const N: usize> DoubleEndedIter
     fn rfold<B, F: FnMut(B, [I::Item; N]) -> B>(mut self, init: B, f: F) -> B {
         self.cut_remainder();
 
-        let Chunks { iter, buffer, .. } = self;
-        iter.rfold(FoldHelper::new(init, buffer), chunks_fold(f))
-            .accum
+        let Chunks { iter, .. } = self;
+        iter.rfold(
+            FoldHelper::new(init, PartialArray::new_back()),
+            chunks_fold(f, PartialArray::push_back),
+        )
+        .accum
     }
 }
 
 // SAFETY: our size is exact, see above
 unsafe impl<I: TrustedLen, const N: usize> TrustedLen for Chunks<I, N> {}
 
-/// An iterator over the remainder that a [`Chunks`] leaves behind.
+/// The remainder left over by a [`Chunks`] buffer.
 ///
-/// This iterator is returned by the [`into_remainder`] method on [`Chunks`]. See its documentation for more
-/// information.
-#[derive(Debug)]
-pub struct IntoRemainder<I, const N: usize> {
-    /// Internal buffer containing remainder items.
-    remainder: [MaybeUninit<I>; N],
-    /// Range over which `remainder` is valid.
-    initialized: Range<usize>,
+/// This struct is returned by the `into_remainder` method on `Chunks`. See the documentation of that item for
+/// more information.
+#[derive(Debug, Clone)]
+pub struct IntoRemainder<Item, const N: usize> {
+    remainder: PartialArray<Item, N>,
 }
 
-impl<I: Clone, const N: usize> Clone for IntoRemainder<I, N> {
-    fn clone(&self) -> IntoRemainder<I, N> {
-        let mut into_remainder = IntoRemainder {
-            remainder: MaybeUninit::uninit_array(),
-            initialized: self.initialized.start..self.initialized.start,
-        };
+impl<Item, const N: usize> Iterator for IntoRemainder<Item, N> {
+    type Item = Item;
 
-        for i in self.initialized.clone() {
-            // SAFETY: remainder[i] is guaranteed to be initialized
-            into_remainder.remainder[i] = MaybeUninit::new(unsafe {
-                MaybeUninit::assume_init_read(&self.remainder[i]).clone()
-            });
-
-            // increment initialized range by 1
-            into_remainder.initialized.end += 1;
-        }
-
-        into_remainder
-    }
-}
-
-impl<I, const N: usize> Iterator for IntoRemainder<I, N> {
-    type Item = I;
-
-    fn next(&mut self) -> Option<I> {
-        // SAFETY: remainder at "i" is guaranteed to be valid
-        self.initialized
-            .next()
-            .map(|i| unsafe { MaybeUninit::assume_init_read(&self.remainder[i]) })
+    fn next(&mut self) -> Option<Item> {
+        // SAFETY: "i" is guaranteed to be an initialized index
+        self.remainder.initialized.next().map(|i| unsafe {
+            MaybeUninit::assume_init_read(self.remainder.buffer.get_unchecked(i))
+        })
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        self.initialized.size_hint()
+        self.remainder.initialized.size_hint()
     }
-}
 
-impl<I, const N: usize> FusedIterator for IntoRemainder<I, N> {}
-impl<I, const N: usize> ExactSizeIterator for IntoRemainder<I, N> {}
-
-impl<I, const N: usize> DoubleEndedIterator for IntoRemainder<I, N> {
-    fn next_back(&mut self) -> Option<I> {
+    fn nth(&mut self, n: usize) -> Option<Item> {
         // SAFETY: same as above
-        self.initialized
-            .next_back()
-            .map(|i| unsafe { MaybeUninit::assume_init_read(&self.remainder[i]) })
+        self.remainder.initialized.nth(n).map(|i| unsafe {
+            MaybeUninit::assume_init_read(self.remainder.buffer.get_unchecked(i))
+        })
     }
 }
 
-impl<I, const N: usize> Drop for IntoRemainder<I, N> {
-    fn drop(&mut self) {
-        let valid_ptr = MaybeUninit::slice_as_mut_ptr(&mut self.remainder);
-        // SAFETY: valid_ptr is an array, guaranteed to be valid for "initialized"
-        let valid_ptr = unsafe { valid_ptr.add(self.initialized.start) };
-        let valid = ptr::slice_from_raw_parts_mut(valid_ptr, self.initialized.len());
+// Range<usize> is Fused, ExactSize and TrustedLen
+impl<Item, const N: usize> FusedIterator for IntoRemainder<Item, N> {}
+impl<Item, const N: usize> ExactSizeIterator for IntoRemainder<Item, N> {}
+unsafe impl<Item, const N: usize> TrustedLen for IntoRemainder<Item, N> {}
 
-        // SAFETY: because of initialized, this is guaranteed to be valid
-        unsafe {
-            ptr::drop_in_place(valid);
-        }
+impl<Item, const N: usize> DoubleEndedIterator for IntoRemainder<Item, N> {
+    fn next_back(&mut self) -> Option<Item> {
+        // SAFETY: same as above
+        self.remainder.initialized.next_back().map(|i| unsafe {
+            MaybeUninit::assume_init_read(self.remainder.buffer.get_unchecked(i))
+        })
     }
 }
 
-/// Helper method for next(); fills up the chunk buffer and breaks when it is full.
-#[inline]
+/// Helper function for the next() methods.
 fn fill_chunk_buffer<Item, const N: usize>(
-    chunk_buffer: &mut ChunkBuffer<Item, N>,
-    item: Item,
-) -> ControlFlow<[Item; N], &mut ChunkBuffer<Item, N>> {
-    // SAFETY: if we're still running, we haven't exhausted the buffer yet
-    if unsafe { chunk_buffer.push(item) } {
-        // SAFETY: the chunk buffer is full, time to return
-        ControlFlow::Break(unsafe { chunk_buffer.assume_init() })
-    } else {
-        ControlFlow::Continue(chunk_buffer)
+    push: unsafe fn(&mut PartialArray<Item, N>, Item) -> bool,
+) -> impl FnMut(&mut PartialArray<Item, N>, Item) -> ControlFlow<[Item; N], &mut PartialArray<Item, N>>
+{
+    move |pa, item| {
+        // SAFETY: we call assume_init immediately after it returns true
+        if unsafe { push(pa, item) } {
+            ControlFlow::Break(unsafe { pa.assume_init() })
+        } else {
+            ControlFlow::Continue(pa)
+        }
     }
 }
 
 /// Helper function for try-folding over the iterator.
 fn chunks_try_fold<'a, Acc, Item, R: Try<Output = Acc>, const N: usize>(
     mut f: impl FnMut(Acc, [Item; N]) -> R,
+    push: unsafe fn(&mut PartialArray<Item, N>, Item) -> bool,
 ) -> impl FnMut(
     TryFoldHelper<'a, Item, Acc, N>,
     Item,
 ) -> ControlFlow<R::Residual, TryFoldHelper<'a, Item, Acc, N>> {
     // SAFETY: same as above
     move |mut folder: TryFoldHelper<'a, Item, Acc, N>, item| {
-        if unsafe { folder.buffer.push(item) } {
+        if unsafe { push(&mut folder.buffer, item) } {
             // take the buffer out and initialize it, then update the accum
             let buffer = unsafe { folder.buffer.assume_init() };
             folder.accum = match f(folder.accum, buffer).branch() {
@@ -389,10 +402,11 @@ fn chunks_try_fold<'a, Acc, Item, R: Try<Output = Acc>, const N: usize>(
 /// Helper function for folding over the iterator.
 fn chunks_fold<Acc, Item, const N: usize>(
     mut f: impl FnMut(Acc, [Item; N]) -> Acc,
+    push: unsafe fn(&mut PartialArray<Item, N>, Item) -> bool,
 ) -> impl FnMut(FoldHelper<Item, Acc, N>, Item) -> FoldHelper<Item, Acc, N> {
     // SAFETY: same as above
     move |mut folder, item| {
-        if unsafe { folder.buffer.push(item) } {
+        if unsafe { push(&mut folder.buffer, item) } {
             let buffer = unsafe { folder.buffer.assume_init() };
             folder.accum = f(folder.accum, buffer);
         }
@@ -404,13 +418,13 @@ fn chunks_fold<Acc, Item, const N: usize>(
 /// Helper for try-folding over this iterator.
 struct TryFoldHelper<'a, Item, B, const N: usize> {
     /// Reference to the buffer holding the contents we need to fold over.
-    buffer: &'a mut ChunkBuffer<Item, N>,
+    buffer: &'a mut PartialArray<Item, N>,
     /// The current accumulator.
     accum: B,
 }
 
 impl<'a, Item, B, const N: usize> TryFoldHelper<'a, Item, B, N> {
-    fn new(accum: B, buffer: &'a mut ChunkBuffer<Item, N>) -> TryFoldHelper<'a, Item, B, N> {
+    fn new(accum: B, buffer: &'a mut PartialArray<Item, N>) -> TryFoldHelper<'a, Item, B, N> {
         TryFoldHelper { buffer, accum }
     }
 }
@@ -418,120 +432,160 @@ impl<'a, Item, B, const N: usize> TryFoldHelper<'a, Item, B, N> {
 /// Helper for folding over this iterator.
 struct FoldHelper<Item, B, const N: usize> {
     /// Inner buffer holding elements we are currently folding over.
-    buffer: ChunkBuffer<Item, N>,
+    buffer: PartialArray<Item, N>,
     /// The currently accumulator.
     accum: B,
 }
 
 impl<Item, B, const N: usize> FoldHelper<Item, B, N> {
-    fn new(accum: B, buffer: ChunkBuffer<Item, N>) -> FoldHelper<Item, B, N> {
+    fn new(accum: B, buffer: PartialArray<Item, N>) -> FoldHelper<Item, B, N> {
         FoldHelper { buffer, accum }
     }
 }
 
-/// A buffer to store items in while we iterate over them. If this buffer is dropped, all initialized elements
-/// within are dropped as well.
-///
-/// This is similar to an `ArrayVec<[T; N]>`. There may or may not be a better alternative to this.
+/// A partial array, where one or more of the elements in the array are uninitialized. This is used by `Chunks`
+/// in order to construct arrays on the stack, piece by piece.
 #[derive(Debug)]
-struct ChunkBuffer<Item, const N: usize> {
-    /// Internal buffer for storing elements.
+struct PartialArray<Item, const N: usize> {
+    /// The actual array we are filling.
     buffer: [MaybeUninit<Item>; N],
-    /// The number of elements in `buffer` that are initialized. In range notation, elements in the range of
-    /// `0..initialized` are initialized.
-    initialized: usize,
+    /// Defines the range of values that are initialized.
+    initialized: Range<usize>,
+    /// True if we're iterating from the front, false if we're iterating from the back. Used in the
+    /// `assume_init` function to reset the `initialized` variable.
+    is_front: bool,
 }
 
-impl<Item: Clone, const N: usize> Clone for ChunkBuffer<Item, N> {
-    fn clone(&self) -> ChunkBuffer<Item, N> {
-        let mut copied_buffer = ChunkBuffer::new();
-
-        // begin copying elements over to the copied buffer
-        for i in 0..self.initialized {
-            // SAFETY: we know self.buffer[i] is initialized
-            copied_buffer.buffer[i] =
-                MaybeUninit::new(unsafe { MaybeUninit::assume_init_ref(&self.buffer[i]).clone() });
-
-            // bump the initialized count by 1
-            copied_buffer.initialized += 1;
-        }
-
-        copied_buffer
-    }
-}
-
-impl<Item, const N: usize> ChunkBuffer<Item, N> {
-    /// Create an empty `ChunkBuffer`.
-    fn new() -> ChunkBuffer<Item, N> {
-        ChunkBuffer {
+impl<Item: Clone, const N: usize> Clone for PartialArray<Item, N> {
+    fn clone(&self) -> PartialArray<Item, N> {
+        let mut partial = PartialArray {
             buffer: MaybeUninit::uninit_array(),
-            initialized: 0,
+            initialized: self.initialized.start..self.initialized.start,
+            is_front: self.is_front,
+        };
+
+        // copy over cloned elements; only increment initialized after copying
+        for i in self.initialized.clone() {
+            // SAFETY: "i" is guaranteed to be the index of an initialized element
+            partial.buffer[i] = MaybeUninit::new(
+                unsafe { MaybeUninit::assume_init_ref(self.buffer.get_unchecked(i)) }.clone(),
+            );
+            partial.initialized.end += 1;
+        }
+
+        partial
+    }
+}
+
+impl<Item, const N: usize> PartialArray<Item, N> {
+    /// Create a new `PartialArray` that starts from the front.
+    fn new() -> PartialArray<Item, N> {
+        PartialArray {
+            buffer: MaybeUninit::uninit_array(),
+            initialized: 0..0,
+            is_front: true,
         }
     }
 
-    /// Push a new element onto this `ChunkBuffer`. Returns `true` if the `ChunkBuffer` is full.
+    /// Create a new `PartialArray` that starts from the back.
+    fn new_back() -> PartialArray<Item, N> {
+        PartialArray {
+            buffer: MaybeUninit::uninit_array(),
+            initialized: N..N,
+            is_front: false,
+        }
+    }
+
+    /// Push a new entry on from the front. Returns true if the array is now full.
     ///
     /// # Safety
     ///
-    /// If this method previously returned `true`, pushing more elements into the `ChunkBuffer` is undefined
-    /// behavior.
+    /// If this is called on a `PartialArray` not instantiated via `new` or cloning from one that was, the
+    /// results are undefined. If this is called after `true` is returned without assuming initialization, the
+    /// results are also undefined.
     unsafe fn push(&mut self, item: Item) -> bool {
-        // SAFETY: we know we're writing into uninitialized memory, because "initialized" doesn't cover it yet.
-        //         the caller asserts that we're writing in the bounds of the array
-        ptr::write(
-            self.buffer.get_unchecked_mut(self.initialized).as_mut_ptr(),
-            item,
-        );
+        debug_assert!(self.is_front);
 
-        // increment the initialized count by 1
-        self.initialized += 1;
+        // SAFETY: we know that the element at initialized.end is uninitialized, and that initialized fits within
+        //         the array
+        unsafe {
+            ptr::write(
+                self.buffer
+                    .get_unchecked_mut(self.initialized.end)
+                    .as_mut_ptr(),
+                item,
+            )
+        };
 
-        self.initialized == N
+        self.initialized.end += 1;
+        self.initialized.end == N
     }
 
-    /// Initializes the inner buffer array and then returns it.
+    /// Push a new entry on from the back. Returns true if the array is now full.
     ///
     /// # Safety
     ///
-    /// If `push` did not previously return `true`, the behavior of this function is undefined.
+    /// If this is called on a `PartialArray` not instantiated via `new_back` or cloning from one that was, the
+    /// results are undefined. If this is called after `true` is returned without assuming initialization, the
+    /// results are also undefined.
+    unsafe fn push_back(&mut self, item: Item) -> bool {
+        debug_assert!(!self.is_front);
+
+        // SAFETY: we know that the element at initialized.start - 1 is uninitialized, and that initialized
+        //         fits within the array
+        unsafe {
+            ptr::write(
+                self.buffer
+                    .get_unchecked_mut(self.initialized.start - 1)
+                    .as_mut_ptr(),
+                item,
+            )
+        };
+
+        self.initialized.start -= 1;
+        self.initialized.start == 0
+    }
+
+    /// Assume that this `PartialArray` is fully initialized, and reads out the array from there.
+    ///
+    /// # Safety
+    ///
+    /// If this is not called after either `push_back` or `push` returns true, behavior is undefined.
     unsafe fn assume_init(&mut self) -> [Item; N] {
-        // SAFETY: if `push` returned true, `buffer` is fully initialized
-        //         we set "initialized" to zero, so the buffer essentially returns to being uninitialized
-        let res = MaybeUninit::array_assume_init(ptr::read(&self.buffer));
-        self.initialized = 0;
-        res
+        // SAFETY: entire array is valid
+        let arr = unsafe { ptr::read(&self.buffer) };
+        let arr = unsafe { MaybeUninit::array_assume_init(arr) };
+
+        // SAFETY: sets the entire array to being uninitialized
+        self.initialized = if self.is_front { 0..0 } else { N..N };
+
+        arr
     }
 
-    /// Gets the slice containing the initialized memory in this buffer.
+    /// Get the initialized part of this `PartialArray`.
     fn initialized_slice(&self) -> &[Item] {
-        // SAFETY: we know that 0..initialized is initialized
-        unsafe { MaybeUninit::slice_assume_init_ref(&self.buffer[..self.initialized]) }
+        // SAFETY: these elements are initialized, and initialized is guaranteed to fit into the array
+        unsafe {
+            MaybeUninit::slice_assume_init_ref(self.buffer.get_unchecked(self.initialized.clone()))
+        }
     }
 
-    /// Gets the mutable slice containing the initialized memory in this buffer.
+    /// Get a mutable slice of the initialized part of this `PartialArray`.
     fn initialized_slice_mut(&mut self) -> &mut [Item] {
         // SAFETY: same as above
-        unsafe { MaybeUninit::slice_assume_init_mut(&mut self.buffer[..self.initialized]) }
-    }
-
-    /// Converts this `ChunkBuffer` into its raw parts without dropping the memory involved.
-    fn into_raw_parts(self) -> ([MaybeUninit<Item>; N], usize) {
-        let this = ManuallyDrop::new(self);
-        // SAFETY: since we are not dropped "this", "buffer" is never accessed again
-        let buffer = unsafe { ptr::read(&this.buffer) };
-        (buffer, this.initialized)
+        unsafe {
+            MaybeUninit::slice_assume_init_mut(
+                self.buffer.get_unchecked_mut(self.initialized.clone()),
+            )
+        }
     }
 }
 
-impl<Item, const N: usize> Drop for ChunkBuffer<Item, N> {
+impl<Item, const N: usize> Drop for PartialArray<Item, N> {
     fn drop(&mut self) {
-        // SAFETY: in order to prevent leaks, we need to drop the initialized elements. as stated above, the
-        //         range "..self.initialized" is the range of initialized elements
-        let buf_ptr = MaybeUninit::slice_as_mut_ptr(&mut self.buffer);
-        let init_elements = ptr::slice_from_raw_parts_mut(buf_ptr, self.initialized);
-
+        // SAFETY: prevent leaks by dropping the initialized slice
         unsafe {
-            ptr::drop_in_place(init_elements);
+            ptr::drop_in_place(self.initialized_slice_mut());
         }
     }
 }
@@ -592,5 +646,27 @@ mod tests {
                 a
             });
         assert_eq!(folded, [5, 7, 9]);
+    }
+
+    #[test]
+    fn try_fold_from_back() {
+        let elems = &[1, 1, 3, 4, 1, 2, 6];
+        assert_eq!(elems.iter().copied().chunks::<2>().rfind(|t| t == &[1, 2]), Some([1, 2]));
+    }
+
+    #[test]
+    fn advance_from_back() {
+        let elems = &[1, 1, 3, 4, 1, 2, 6];
+        assert_eq!(elems.iter().copied().chunks::<2>().nth_back(1), Some([3, 4]));
+    }
+
+    #[test]
+    fn remainder_from_back() {
+        let elems = &[1, 2, 3, 4, 5];
+        let mut chunks = elems.iter().copied().chunks::<2>();
+        assert_eq!(chunks.next_back(), Some([3, 4]));
+        assert_eq!(chunks.next_back(), Some([1, 2]));
+        assert_eq!(chunks.next_back(), None);
+        assert_eq!(chunks.remainder(), &[5]);
     }
 }
