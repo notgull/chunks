@@ -12,7 +12,7 @@
 
 use core::{
     iter::{FusedIterator, TrustedLen},
-    mem::{ManuallyDrop, MaybeUninit},
+    mem::MaybeUninit,
     ops::{ControlFlow, Range, Try},
     ptr,
 };
@@ -95,7 +95,7 @@ where
         Chunks {
             iter: self.iter.clone(),
             front_buffer: self.front_buffer.clone(),
-            back_remainder: self.back_remainder.as_ref().cloned(),
+            back_remainder: self.back_remainder.clone(),
         }
     }
 }
@@ -230,12 +230,6 @@ impl<I: Iterator, const N: usize> Iterator for Chunks<I, N> {
         (lo / N, hi.map(|hi| hi / N))
     }
 
-    fn advance_by(&mut self, n: usize) -> Result<(), usize> {
-        // advancing the inner iterator by n * N is advancing over n arrays of length N, so this is valid.
-        // if the advance is cut short, the remainder divided by N tells us how many we advanced over
-        self.iter.advance_by(n * N).map_err(|left| left / N)
-    }
-
     fn try_fold<B, F, R: Try<Output = B>>(&mut self, init: B, f: F) -> R
     where
         F: FnMut(B, [I::Item; N]) -> R,
@@ -277,12 +271,6 @@ impl<I: DoubleEndedIterator + ExactSizeIterator, const N: usize> DoubleEndedIter
         self.iter
             .try_rfold(&mut buffer, fill_chunk_buffer(PartialArray::push_back))
             .break_value()
-    }
-
-    fn advance_back_by(&mut self, n: usize) -> Result<(), usize> {
-        self.cut_remainder();
-
-        self.iter.advance_back_by(n * N).map_err(|left| left / N)
     }
 
     fn try_rfold<B, F, R: Try<Output = B>>(&mut self, init: B, f: F) -> R
