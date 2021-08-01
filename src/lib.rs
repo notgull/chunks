@@ -328,10 +328,12 @@ impl<Item, const N: usize> Iterator for IntoRemainder<Item, N> {
     }
 
     fn nth(&mut self, n: usize) -> Option<Item> {
-        // SAFETY: same as above
-        self.remainder.initialized.nth(n).map(|i| unsafe {
-            MaybeUninit::assume_init_read(self.remainder.buffer.get_unchecked(i))
-        })
+        // SAFETY: ensure elements from start to n are dropped
+        for i in (&mut self.remainder.initialized).take(n) {
+            unsafe { MaybeUninit::assume_init_drop(self.remainder.buffer.get_unchecked_mut(i)) };
+        }
+
+        self.next()
     }
 }
 
