@@ -436,7 +436,7 @@ impl<Item, B, const N: usize> FoldHelper<Item, B, N> {
 /// A partial array, where one or more of the elements in the array are uninitialized. This is used by `Chunks`
 /// in order to construct arrays on the stack, piece by piece.
 #[derive(Debug)]
-struct PartialArray<Item, const N: usize> {
+pub(crate) struct PartialArray<Item, const N: usize> {
     /// The actual array we are filling.
     buffer: [MaybeUninit<Item>; N],
     /// Defines the range of values that are initialized.
@@ -469,7 +469,7 @@ impl<Item: Clone, const N: usize> Clone for PartialArray<Item, N> {
 
 impl<Item, const N: usize> PartialArray<Item, N> {
     /// Create a new `PartialArray` that starts from the front.
-    fn new() -> PartialArray<Item, N> {
+    pub(crate) fn new() -> PartialArray<Item, N> {
         PartialArray {
             buffer: MaybeUninit::uninit_array(),
             initialized: 0..0,
@@ -478,7 +478,7 @@ impl<Item, const N: usize> PartialArray<Item, N> {
     }
 
     /// Create a new `PartialArray` that starts from the back.
-    fn new_back() -> PartialArray<Item, N> {
+    pub(crate) fn new_back() -> PartialArray<Item, N> {
         PartialArray {
             buffer: MaybeUninit::uninit_array(),
             initialized: N..N,
@@ -493,8 +493,9 @@ impl<Item, const N: usize> PartialArray<Item, N> {
     /// If this is called on a `PartialArray` not instantiated via `new` or cloning from one that was, the
     /// results are undefined. If this is called after `true` is returned without assuming initialization, the
     /// results are also undefined.
-    unsafe fn push(&mut self, item: Item) -> bool {
+    pub(crate) unsafe fn push(&mut self, item: Item) -> bool {
         debug_assert!(self.is_front);
+        debug_assert!(self.initialized.end < N);
 
         // SAFETY: we know that the element at initialized.end is uninitialized, and that initialized fits within
         //         the array
@@ -518,8 +519,9 @@ impl<Item, const N: usize> PartialArray<Item, N> {
     /// If this is called on a `PartialArray` not instantiated via `new_back` or cloning from one that was, the
     /// results are undefined. If this is called after `true` is returned without assuming initialization, the
     /// results are also undefined.
-    unsafe fn push_back(&mut self, item: Item) -> bool {
+    pub(crate) unsafe fn push_back(&mut self, item: Item) -> bool {
         debug_assert!(!self.is_front);
+        debug_assert!(self.initialized.start > 0);
 
         // SAFETY: we know that the element at initialized.start - 1 is uninitialized, and that initialized
         //         fits within the array
@@ -541,7 +543,7 @@ impl<Item, const N: usize> PartialArray<Item, N> {
     /// # Safety
     ///
     /// If this is not called after either `push_back` or `push` returns true, behavior is undefined.
-    unsafe fn assume_init(&mut self) -> [Item; N] {
+    pub(crate) unsafe fn assume_init(&mut self) -> [Item; N] {
         // SAFETY: entire array is valid
         let arr = unsafe { ptr::read(&self.buffer) };
         let arr = unsafe { MaybeUninit::array_assume_init(arr) };
